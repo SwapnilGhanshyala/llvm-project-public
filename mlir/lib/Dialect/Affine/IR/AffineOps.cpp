@@ -9,19 +9,23 @@
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/IR/AffineValueMap.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/AffineExprVisitor.h"
+#include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/IntegerSet.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/ShapedOpInterfaces.h"
+#include "mlir/Support/LogicalResult.h"
 #include "mlir/Support/MathExtras.h"
 #include "mlir/Transforms/InliningUtils.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/SmallVectorExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
 #include <numeric>
 #include <optional>
@@ -1122,12 +1126,12 @@ static LogicalResult replaceDimOrSym(AffineMap *map,
 /// Iterate over `operands` and fold away all those produced by an AffineApplyOp
 /// iteratively. Perform canonicalization of map and operands as well as
 /// AffineMap simplification. `map` and `operands` are mutated in place.
-static void composeAffineMapAndOperands(AffineMap *map,
-                                        SmallVectorImpl<Value> *operands) {
+static LogicalResult
+composeAffineMapAndOperands(AffineMap *map, SmallVectorImpl<Value> *operands) {
   if (map->getNumResults() == 0) {
     canonicalizeMapAndOperands(map, operands);
     *map = simplifyAffineMap(*map);
-    return;
+    return success();
   }
 
   MLIRContext *ctx = map->getContext();
@@ -1181,7 +1185,28 @@ static void composeAffineMapAndOperands(AffineMap *map,
 
   // Canonicalize and simplify before returning.
   canonicalizeMapAndOperands(map, operands);
+  for (auto e : map->getResults()) {
+    auto kind = e.getKind();
+    if (kind == AffineExprKind::FloorDiv || kind == AffineExprKind::CeilDiv ||
+        kind == AffineExprKind::Mod) {
+      auto expr = e.cast<AffineBinaryOpExpr>();
+      if (expr.getRHS().isa<AffineConstantExpr>()) {
+
+        int64_t rhsConst = expr.getRHS().cast<AffineConstantExpr>().getValue();
+        // This is a pure affine expr; the RHS is a positive constant.
+        // TODO: emit location of the operation or print the expression
+        if (rhsConst <= 0) {
+          Builder b = Builder(ctx);
+          return emitError(
+              b.getUnknownLoc(),
+              "RHS const operand to floordiv, ceildiv or mod cannot be "
+              "less than or equal to zero.\nAborted!\n");
+        }
+      }
+    }
+  }
   *map = simplifyAffineMap(*map);
+  return success();
 }
 
 void mlir::affine::fullyComposeAffineMapAndOperands(
@@ -1546,7 +1571,11 @@ struct SimplifyAffineOp : public OpRewritePattern<AffineOpTy> {
     AffineMap oldMap = map;
     auto oldOperands = affineOp.getMapOperands();
     SmallVector<Value, 8> resultOperands(oldOperands);
-    composeAffineMapAndOperands(&map, &resultOperands);
+    if (failed(composeAffineMapAndOperands(&map, &resultOperands))) {
+      affineOp->emitRemark("compose failed \n");
+      return failure();
+    }
+    affineOp->emitRemark("incorrect handling");
     canonicalizeMapAndOperands(&map, &resultOperands);
     simplifyMapWithOperands(map, resultOperands);
     if (map == oldMap && std::equal(oldOperands.begin(), oldOperands.end(),
@@ -3040,8 +3069,7 @@ static void composeSetAndOperands(IntegerSet &set,
 }
 
 /// Canonicalize an affine if op's conditional (integer set + operands).
-LogicalResult AffineIfOp::fold(FoldAdaptor,
-                               SmallVectorImpl<OpFoldResult> &) {
+LogicalResult AffineIfOp::fold(FoldAdaptor, SmallVectorImpl<OpFoldResult> &) {
   auto set = getIntegerSet();
   SmallVector<Value, 4> operands(getOperands());
   composeSetAndOperands(set, operands);
@@ -3132,11 +3160,11 @@ static LogicalResult
 verifyMemoryOpIndexing(Operation *op, AffineMapAttr mapAttr,
                        Operation::operand_range mapOperands,
                        MemRefType memrefType, unsigned numIndexOperands) {
-    AffineMap map = mapAttr.getValue();
-    if (map.getNumResults() != memrefType.getRank())
-      return op->emitOpError("affine map num results must equal memref rank");
-    if (map.getNumInputs() != numIndexOperands)
-      return op->emitOpError("expects as many subscripts as affine map inputs");
+  AffineMap map = mapAttr.getValue();
+  if (map.getNumResults() != memrefType.getRank())
+    return op->emitOpError("affine map num results must equal memref rank");
+  if (map.getNumInputs() != numIndexOperands)
+    return op->emitOpError("expects as many subscripts as affine map inputs");
 
   Region *scope = getAffineScope(op);
   for (auto idx : mapOperands) {

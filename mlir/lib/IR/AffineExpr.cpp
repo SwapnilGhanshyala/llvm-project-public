@@ -1333,14 +1333,14 @@ void SimpleAffineExprFlattener::visitDivExpr(AffineBinaryOpExpr expr,
   // This is a pure affine expr; the RHS is a positive constant.
   int64_t rhsConst = rhs[getConstantIndex()];
   // TODO: emit location of the operation or print the expression
-  if (rhsConst <= 0) {
-    OpBuilder b = OpBuilder(context);
-    emitError(b.getUnknownLoc(),
-              "Illegal operation: RHS const operand to FloorDiv or CeilDiv "
-              "cannot be less than or equal to zero.\nAborted!\n");
-    exit(1);
-  }
-  // assert(rhsConst > 0 && "RHS constant has to be positive");
+  // if (rhsConst <= 0) {
+  //   OpBuilder b = OpBuilder(context);
+  //   emitError(b.getUnknownLoc(),
+  //             "Illegal operation: RHS const operand to FloorDiv or CeilDiv "
+  //             "cannot be less than or equal to zero.\nAborted!\n");
+  //   return;
+  // }
+  assert(rhsConst > 0 && "RHS constant has to be positive");
 
   // Simplify the floordiv, ceildiv if possible by canceling out the greatest
   // common divisors of the numerator and denominator.
